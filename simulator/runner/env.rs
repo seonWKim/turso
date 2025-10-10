@@ -300,7 +300,6 @@ impl SimulatorEnv {
             seed,
             ticks: rng
                 .random_range(cli_opts.minimum_tests as usize..=cli_opts.maximum_tests as usize),
-            max_tables: rng.random_range(0..128),
             disable_select_optimizer: cli_opts.disable_select_optimizer,
             disable_insert_values_select: cli_opts.disable_insert_values_select,
             disable_double_create_failure: cli_opts.disable_double_create_failure,
@@ -516,14 +515,6 @@ impl SimulatorEnv {
     }
 }
 
-pub trait ConnectionTrait
-where
-    Self: std::marker::Sized + Clone,
-{
-    fn is_connected(&self) -> bool;
-    fn disconnect(&mut self);
-}
-
 pub(crate) enum SimConnection {
     LimboConnection(Arc<turso_core::Connection>),
     SQLiteConnection(rusqlite::Connection),
@@ -572,7 +563,6 @@ impl Display for SimConnection {
 pub(crate) struct SimulatorOpts {
     pub(crate) seed: u64,
     pub(crate) ticks: usize,
-    pub(crate) max_tables: usize,
 
     pub(crate) disable_select_optimizer: bool,
     pub(crate) disable_insert_values_select: bool,

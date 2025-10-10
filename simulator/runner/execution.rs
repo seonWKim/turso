@@ -46,6 +46,7 @@ impl ExecutionHistory {
 }
 
 pub struct ExecutionResult {
+    #[expect(dead_code)]
     pub history: ExecutionHistory,
     pub error: Option<LimboError>,
 }
@@ -367,6 +368,9 @@ fn execute_query_rusqlite(
                 result.push(row?);
             }
             Ok(result)
+        }
+        Query::Placeholder => {
+            unreachable!("simulation cannot have a placeholder Query for execution")
         }
         _ => {
             connection.execute(query.to_string().as_str(), ())?;

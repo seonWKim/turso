@@ -46,6 +46,7 @@ use crate::translate::pragma::TURSO_CDC_DEFAULT_TABLE_NAME;
 use crate::types::{WalFrameInfo, WalState};
 #[cfg(feature = "fs")]
 use crate::util::{OpenMode, OpenOptions};
+use crate::vdbe::explain::{EXPLAIN_COLUMNS_TYPE, EXPLAIN_QUERY_PLAN_COLUMNS_TYPE};
 use crate::vdbe::metrics::ConnectionMetrics;
 use crate::vtab::VirtualTable;
 use crate::{incremental::view::AllViewsTxState, translate::emitter::TransactionMode};
@@ -62,17 +63,16 @@ pub use io::{
 };
 use parking_lot::RwLock;
 use schema::Schema;
-use std::cell::Cell;
 use std::{
     borrow::Cow,
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::HashMap,
     fmt::{self, Display},
     num::NonZero,
     ops::Deref,
     rc::Rc,
     sync::{
-        atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU16, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicUsize, Ordering},
         Arc, LazyLock, Mutex, Weak,
     },
     time::Duration,
@@ -96,8 +96,8 @@ use turso_macros::match_ignore_ascii_case;
 use turso_parser::ast::fmt::ToTokens;
 use turso_parser::{ast, ast::Cmd, parser::Parser};
 use types::IOResult;
-pub use types::RefValue;
 pub use types::Value;
+pub use types::ValueRef;
 use util::parse_schema_rows;
 pub use util::IOExt;
 pub use vdbe::{builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QUERY_PLAN_COLUMNS};
@@ -489,7 +489,7 @@ impl Database {
                 conn.pragma_update("cipher", format!("'{}'", encryption_opts.cipher))?;
                 conn.pragma_update("hexkey", format!("'{}'", encryption_opts.hexkey))?;
                 // Clear page cache so the header page can be reread from disk and decrypted using the encryption context.
-                pager.clear_page_cache();
+                pager.clear_page_cache(false);
             }
             db.with_schema_mut(|schema| {
                 let header_schema_cookie = pager
@@ -582,6 +582,8 @@ impl Database {
             data_sync_retry: AtomicBool::new(false),
             busy_timeout: RwLock::new(Duration::new(0, 0)),
             is_mvcc_bootstrap_connection: AtomicBool::new(is_mvcc_bootstrap_connection),
+            fk_pragma: AtomicBool::new(false),
+            fk_deferred_violations: AtomicIsize::new(0),
         });
         self.n_connections
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1099,6 +1101,9 @@ pub struct Connection {
     busy_timeout: RwLock<std::time::Duration>,
     /// Whether this is an internal connection used for MVCC bootstrap
     is_mvcc_bootstrap_connection: AtomicBool,
+    /// Whether pragma foreign_keys=ON for this connection
+    fk_pragma: AtomicBool,
+    fk_deferred_violations: AtomicIsize,
 }
 
 impl Drop for Connection {
@@ -1508,7 +1513,7 @@ impl Connection {
             let pager = conn.pager.read();
             if db.db_state.is_initialized() {
                 // Clear page cache so the header page can be reread from disk and decrypted using the encryption context.
-                pager.clear_page_cache();
+                pager.clear_page_cache(false);
             }
         }
         Ok((io, conn))
@@ -1529,6 +1534,21 @@ impl Connection {
             std::fs::set_permissions(&opts.path, perms.permissions())?;
         }
         Ok(db)
+    }
+
+    pub fn set_foreign_keys_enabled(&self, enable: bool) {
+        self.fk_pragma.store(enable, Ordering::Release);
+    }
+
+    pub fn foreign_keys_enabled(&self) -> bool {
+        self.fk_pragma.load(Ordering::Acquire)
+    }
+    pub(crate) fn clear_deferred_foreign_key_violations(&self) -> isize {
+        self.fk_deferred_violations.swap(0, Ordering::Release)
+    }
+
+    pub(crate) fn get_deferred_foreign_key_violations(&self) -> isize {
+        self.fk_deferred_violations.load(Ordering::Acquire)
     }
 
     pub fn maybe_update_schema(&self) {
@@ -1720,11 +1740,6 @@ impl Connection {
         self.pager.read().cacheflush()
     }
 
-    pub fn clear_page_cache(&self) -> Result<()> {
-        self.pager.read().clear_page_cache();
-        Ok(())
-    }
-
     pub fn checkpoint(&self, mode: CheckpointMode) -> Result<CheckpointResult> {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
@@ -1868,7 +1883,7 @@ impl Connection {
             shared_wal.enabled.store(false, Ordering::SeqCst);
             shared_wal.file = None;
         }
-        self.pager.write().clear_page_cache();
+        self.pager.write().clear_page_cache(false);
         let pager = self.db.init_pager(Some(size.get() as usize))?;
         pager.enable_encryption(self.db.opts.enable_encryption);
         *self.pager.write() = Arc::new(pager);
@@ -2340,7 +2355,7 @@ impl Connection {
         *self.mv_tx.read()
     }
 
-    pub(crate) fn set_mvcc_checkpoint_threshold(&self, threshold: u64) -> Result<()> {
+    pub(crate) fn set_mvcc_checkpoint_threshold(&self, threshold: i64) -> Result<()> {
         match self.db.mv_store.as_ref() {
             Some(mv_store) => {
                 mv_store.set_checkpoint_threshold(threshold);
@@ -2350,7 +2365,7 @@ impl Connection {
         }
     }
 
-    pub(crate) fn mvcc_checkpoint_threshold(&self) -> Result<u64> {
+    pub(crate) fn mvcc_checkpoint_threshold(&self) -> Result<i64> {
         match self.db.mv_store.as_ref() {
             Some(mv_store) => Ok(mv_store.checkpoint_threshold()),
             None => Err(LimboError::InternalError("MVCC not enabled".into())),
@@ -2667,6 +2682,17 @@ impl Statement {
     }
 
     pub fn get_column_name(&self, idx: usize) -> Cow<'_, str> {
+        if self.query_mode == QueryMode::Explain {
+            return Cow::Owned(EXPLAIN_COLUMNS.get(idx).expect("No column").to_string());
+        }
+        if self.query_mode == QueryMode::ExplainQueryPlan {
+            return Cow::Owned(
+                EXPLAIN_QUERY_PLAN_COLUMNS
+                    .get(idx)
+                    .expect("No column")
+                    .to_string(),
+            );
+        }
         match self.query_mode {
             QueryMode::Normal => {
                 let column = &self.program.result_columns.get(idx).expect("No column");
@@ -2685,6 +2711,9 @@ impl Statement {
     }
 
     pub fn get_column_table_name(&self, idx: usize) -> Option<Cow<'_, str>> {
+        if self.query_mode == QueryMode::Explain || self.query_mode == QueryMode::ExplainQueryPlan {
+            return None;
+        }
         let column = &self.program.result_columns.get(idx).expect("No column");
         match &column.expr {
             turso_parser::ast::Expr::Column { table, .. } => self
@@ -2697,6 +2726,22 @@ impl Statement {
     }
 
     pub fn get_column_type(&self, idx: usize) -> Option<String> {
+        if self.query_mode == QueryMode::Explain {
+            return Some(
+                EXPLAIN_COLUMNS_TYPE
+                    .get(idx)
+                    .expect("No column")
+                    .to_string(),
+            );
+        }
+        if self.query_mode == QueryMode::ExplainQueryPlan {
+            return Some(
+                EXPLAIN_QUERY_PLAN_COLUMNS_TYPE
+                    .get(idx)
+                    .expect("No column")
+                    .to_string(),
+            );
+        }
         let column = &self.program.result_columns.get(idx).expect("No column");
         match &column.expr {
             turso_parser::ast::Expr::Column {

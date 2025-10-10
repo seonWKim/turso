@@ -714,7 +714,7 @@ use crate::types::Text;
 use crate::Value;
 use crate::{Database, StepResult};
 use crate::{MemoryIO, Statement};
-use crate::{RefValue, DATABASE_MANAGER};
+use crate::{ValueRef, DATABASE_MANAGER};
 
 // Simple atomic clock implementation for testing
 
@@ -978,8 +978,8 @@ fn test_cursor_modification_during_scan() {
     record.start_serialization(&row.data);
     let value = record.get_value(0).unwrap();
     match value {
-        RefValue::Text(text) => {
-            assert_eq!(text.as_str(), "new_row");
+        ValueRef::Text(text, _) => {
+            assert_eq!(text, b"new_row");
         }
         _ => panic!("Expected Text value"),
     }
@@ -1074,7 +1074,7 @@ fn test_snapshot_isolation_tx_visible1() {
 
     let current_tx = new_tx(4, 4, TransactionState::Preparing);
 
-    let rv_visible = |begin: TxTimestampOrID, end: Option<TxTimestampOrID>| {
+    let rv_visible = |begin: Option<TxTimestampOrID>, end: Option<TxTimestampOrID>| {
         let row_version = RowVersion {
             begin,
             end,
@@ -1086,60 +1086,60 @@ fn test_snapshot_isolation_tx_visible1() {
 
     // begin visible:   transaction committed with ts < current_tx.begin_ts
     // end visible:     inf
-    assert!(rv_visible(TxTimestampOrID::TxID(1), None));
+    assert!(rv_visible(Some(TxTimestampOrID::TxID(1)), None));
 
     // begin invisible: transaction committed with ts > current_tx.begin_ts
-    assert!(!rv_visible(TxTimestampOrID::TxID(2), None));
+    assert!(!rv_visible(Some(TxTimestampOrID::TxID(2)), None));
 
     // begin invisible: transaction aborted
-    assert!(!rv_visible(TxTimestampOrID::TxID(3), None));
+    assert!(!rv_visible(Some(TxTimestampOrID::TxID(3)), None));
 
     // begin visible:   timestamp < current_tx.begin_ts
     // end invisible:   transaction committed with ts > current_tx.begin_ts
     assert!(!rv_visible(
-        TxTimestampOrID::Timestamp(0),
+        Some(TxTimestampOrID::Timestamp(0)),
         Some(TxTimestampOrID::TxID(1))
     ));
 
     // begin visible:   timestamp < current_tx.begin_ts
     // end visible:     transaction committed with ts < current_tx.begin_ts
     assert!(rv_visible(
-        TxTimestampOrID::Timestamp(0),
+        Some(TxTimestampOrID::Timestamp(0)),
         Some(TxTimestampOrID::TxID(2))
     ));
 
     // begin visible:   timestamp < current_tx.begin_ts
     // end invisible:   transaction aborted
     assert!(!rv_visible(
-        TxTimestampOrID::Timestamp(0),
+        Some(TxTimestampOrID::Timestamp(0)),
         Some(TxTimestampOrID::TxID(3))
     ));
 
     // begin invisible: transaction preparing
-    assert!(!rv_visible(TxTimestampOrID::TxID(5), None));
+    assert!(!rv_visible(Some(TxTimestampOrID::TxID(5)), None));
 
     // begin invisible: transaction committed with ts > current_tx.begin_ts
-    assert!(!rv_visible(TxTimestampOrID::TxID(6), None));
+    assert!(!rv_visible(Some(TxTimestampOrID::TxID(6)), None));
 
     // begin invisible: transaction active
-    assert!(!rv_visible(TxTimestampOrID::TxID(7), None));
+    assert!(!rv_visible(Some(TxTimestampOrID::TxID(7)), None));
 
     // begin invisible: transaction committed with ts > current_tx.begin_ts
-    assert!(!rv_visible(TxTimestampOrID::TxID(6), None));
+    assert!(!rv_visible(Some(TxTimestampOrID::TxID(6)), None));
 
     // begin invisible:   transaction active
-    assert!(!rv_visible(TxTimestampOrID::TxID(7), None));
+    assert!(!rv_visible(Some(TxTimestampOrID::TxID(7)), None));
 
     // begin visible:   timestamp < current_tx.begin_ts
     // end invisible:     transaction preparing
     assert!(!rv_visible(
-        TxTimestampOrID::Timestamp(0),
+        Some(TxTimestampOrID::Timestamp(0)),
         Some(TxTimestampOrID::TxID(5))
     ));
 
     // begin invisible: timestamp > current_tx.begin_ts
     assert!(!rv_visible(
-        TxTimestampOrID::Timestamp(6),
+        Some(TxTimestampOrID::Timestamp(6)),
         Some(TxTimestampOrID::TxID(6))
     ));
 
@@ -1148,9 +1148,11 @@ fn test_snapshot_isolation_tx_visible1() {
     //                  but that hasn't happened
     //                  (this is the https://avi.im/blag/2023/hekaton-paper-typo/ case, I believe!)
     assert!(rv_visible(
-        TxTimestampOrID::Timestamp(0),
+        Some(TxTimestampOrID::Timestamp(0)),
         Some(TxTimestampOrID::TxID(7))
     ));
+
+    assert!(!rv_visible(None, None));
 }
 
 #[test]
@@ -1210,8 +1212,8 @@ fn test_restart() {
             .unwrap();
         let record = get_record_value(&row);
         match record.get_value(0).unwrap() {
-            RefValue::Text(text) => {
-                assert_eq!(text.as_str(), "bar");
+            ValueRef::Text(text, _) => {
+                assert_eq!(text, b"bar");
             }
             _ => panic!("Expected Text value"),
         }

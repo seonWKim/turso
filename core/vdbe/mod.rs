@@ -32,16 +32,16 @@ use crate::{
     state_machine::StateMachine,
     storage::{pager::PagerCommitResult, sqlite3_ondisk::SmallVec},
     translate::{collate::CollationSeq, plan::TableReferences},
-    types::{IOCompletions, IOResult, RawSlice, TextRef},
+    types::{IOCompletions, IOResult},
     vdbe::{
         execute::{
-            OpCheckpointState, OpColumnState, OpDeleteState, OpDeleteSubState, OpIdxInsertState,
-            OpInsertState, OpInsertSubState, OpNewRowidState, OpNoConflictState, OpRowIdState,
-            OpSeekState, OpTransactionState,
+            OpCheckpointState, OpColumnState, OpDeleteState, OpDeleteSubState, OpDestroyState,
+            OpIdxInsertState, OpInsertState, OpInsertSubState, OpNewRowidState, OpNoConflictState,
+            OpRowIdState, OpSeekState, OpTransactionState,
         },
         metrics::StatementMetrics,
     },
-    RefValue,
+    ValueRef,
 };
 
 use crate::{
@@ -290,6 +290,7 @@ pub struct ProgramState {
     #[cfg(feature = "json")]
     json_cache: JsonCacheCell,
     op_delete_state: OpDeleteState,
+    op_destroy_state: OpDestroyState,
     op_idx_delete_state: Option<OpIdxDeleteState>,
     op_integrity_check_state: OpIntegrityCheckState,
     /// Metrics collected during statement execution
@@ -312,6 +313,7 @@ pub struct ProgramState {
     /// This is used when statement in auto-commit mode reseted after previous uncomplete execution - in which case we may need to rollback transaction started on previous attempt
     /// Note, that MVCC transactions are always explicit - so they do not update auto_txn_cleanup marker
     pub(crate) auto_txn_cleanup: TxnCleanup,
+    fk_scope_counter: isize,
 }
 
 impl ProgramState {
@@ -338,6 +340,7 @@ impl ProgramState {
                 sub_state: OpDeleteSubState::MaybeCaptureRecord,
                 deleted_record: None,
             },
+            op_destroy_state: OpDestroyState::CreateCursor,
             op_idx_delete_state: None,
             op_integrity_check_state: OpIntegrityCheckState::Start,
             metrics: StatementMetrics::new(),
@@ -357,6 +360,7 @@ impl ProgramState {
             op_checkpoint_state: OpCheckpointState::StartCheckpoint,
             view_delta_state: ViewDeltaCommitState::NotStarted,
             auto_txn_cleanup: TxnCleanup::None,
+            fk_scope_counter: 0,
         }
     }
 
@@ -828,7 +832,6 @@ impl Program {
 
         // Reset state for next use
         program_state.view_delta_state = ViewDeltaCommitState::NotStarted;
-
         if self.connection.get_tx_state() == TransactionState::None {
             // No need to do any work here if not in tx. Current MVCC logic doesn't work with this assumption,
             // hence the mv_store.is_none() check.
@@ -999,22 +1002,10 @@ fn make_record(registers: &[Register], start_reg: &usize, count: &usize) -> Immu
     ImmutableRecord::from_registers(regs, regs.len())
 }
 
-pub fn registers_to_ref_values(registers: &[Register]) -> Vec<RefValue> {
+pub fn registers_to_ref_values<'a>(registers: &'a [Register]) -> Vec<ValueRef<'a>> {
     registers
         .iter()
-        .map(|reg| {
-            let value = reg.get_value();
-            match value {
-                Value::Null => RefValue::Null,
-                Value::Integer(i) => RefValue::Integer(*i),
-                Value::Float(f) => RefValue::Float(*f),
-                Value::Text(t) => RefValue::Text(TextRef {
-                    value: RawSlice::new(t.value.as_ptr(), t.value.len()),
-                    subtype: t.subtype,
-                }),
-                Value::Blob(b) => RefValue::Blob(RawSlice::new(b.as_ptr(), b.len())),
-            }
-        })
+        .map(|reg| reg.get_value().as_ref())
         .collect()
 }
 
